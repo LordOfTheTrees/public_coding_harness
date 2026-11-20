@@ -12,6 +12,7 @@
 #   planner (when todo is empty) -> worker on branch task/<id> -> verify.sh
 #   -> evaluator -> merge to main, or append feedback and return the task
 #   -> cleaner every CLEAN_EVERY merges, reverted if verify.sh fails
+#   -> optional Jev "keep building?" check after a merge (fail open)
 #
 # The board lives in .factory/, which is gitignored. That state is coordination,
 # not part of the kit a clone should receive. Pass/fail is the first line of the
@@ -24,6 +25,8 @@
 #         Those are Cursor-pool models. Claude runs map them back to sonnet and Haiku.
 #         A usage-limit message sleeps until the reset time and retries the same
 #         role. That wait does not count as a failed attempt.
+#         JEV_GATE=on|off (default on when TYPESAFE_API_KEY is set)
+#         JEV_CONTINUE_THRESHOLD (default 0.5)  JEV_MOCK_NOUL (no-network stub)
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 1
 HERE="$PWD/harness"
@@ -116,6 +119,145 @@ Never run git commit, checkout, merge, reset, or push; the harness handles git. 
   done
 }
 
+# Ask Jev whether the merged project still needs work. Return 0 to keep
+# building and 1 to stop. Missing key, JEV_GATE=off, and any Jev error keep
+# the loop on its existing stops (planner DONE and MAX_ITERS).
+jev_keep_building() { # <merged-task-id>
+  local task="$1" review req resp noul threshold decision reason
+  case "${JEV_GATE:-}" in
+    off|OFF) return 0 ;;
+  esac
+  if ! "$HERE/jev.sh" configured >/dev/null 2>&1; then
+    return 0
+  fi
+  # Mock and CI runs must not open a network connection. Without an explicit
+  # stub, skip the call and keep going.
+  if [ "${AGENT_CLI:-}" = "mock" ] && [ -z "${JEV_MOCK_NOUL:-}" ]; then
+    return 0
+  fi
+
+  review="$FACTORY/reviews/$task.md"
+  req="$FACTORY/logs/jev-last-request.json"
+  resp="$FACTORY/logs/jev-last-response.json"
+  if ! python3 - "$PWD/SPEC.md" "$B" "$review" > "$req" <<'PY'
+import json, os, sys
+spec_path, board, review = sys.argv[1:]
+
+def clip(text, limit):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n…[trimmed]"
+
+def titles(dirname, limit=30):
+    found = []
+    path = os.path.join(board, dirname)
+    if not os.path.isdir(path):
+        return found
+    for name in sorted(os.listdir(path)):
+        if not name.endswith(".md"):
+            continue
+        title = name[:-3]
+        try:
+            with open(os.path.join(path, name), encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        title = line.lstrip("#").strip() or title
+                        break
+        except OSError:
+            pass
+        found.append(title[:200])
+        if len(found) >= limit:
+            break
+    return found
+
+def block(label, items):
+    if not items:
+        return label + ":\n- (none)"
+    return label + ":\n" + "\n".join("- " + item for item in items)
+
+if os.path.isfile(spec_path):
+    with open(spec_path, encoding="utf-8", errors="replace") as fh:
+        spec = clip(fh.read(), 4000)
+else:
+    spec = "(SPEC.md missing)"
+if os.path.isfile(review):
+    with open(review, encoding="utf-8", errors="replace") as fh:
+        verdict = clip(fh.read(), 1500)
+else:
+    verdict = "(none)"
+state = "\n\n".join([
+    "SPEC.md:\n" + spec,
+    block("Done", titles("done")),
+    block("Open", titles("todo") + titles("doing")),
+    block("Failed", titles("blocked")),
+    "Latest evaluator verdict:\n" + verdict,
+])
+state = clip(state, 8000)
+json.dump({
+    "state": state,
+    "questions": {
+        "keep_building": {
+            "type": "noul",
+            "instructions": "Does this project still need more building to meet the intent in SPEC.md? Y/N.",
+        }
+    },
+}, sys.stdout)
+sys.stdout.write("\n")
+PY
+  then
+    log "   jev gate: could not build the request; continuing (fail open)"
+    return 0
+  fi
+
+  if ! "$HERE/jev.sh" < "$req" > "$resp" 2>>"$FACTORY/logs/jev-gate.log"; then
+    printf '%s noul= decision=continue reason=jev error (fail open)\n' "$(date '+%F %T')" >> "$FACTORY/logs/jev-gate.log"
+    log "   jev gate: Jev failed; continuing (fail open)"
+    return 0
+  fi
+
+  threshold="${JEV_CONTINUE_THRESHOLD:-0.5}"
+  if ! noul=$(python3 - "$resp" "$threshold" <<'PY'
+import json, sys
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+    noul = payload.get("answers", {}).get("keep_building", {}).get("noul")
+    threshold = float(sys.argv[2])
+except (OSError, ValueError, json.JSONDecodeError):
+    sys.exit(2)
+if not isinstance(noul, (int, float)) or isinstance(noul, bool):
+    sys.exit(2)
+print(f"{float(noul):.6f} {threshold:.6f}")
+PY
+  ); then
+    printf '%s noul= decision=continue reason=unreadable noul (fail open)\n' "$(date '+%F %T')" >> "$FACTORY/logs/jev-gate.log"
+    log "   jev gate: unreadable noul; continuing (fail open)"
+    return 0
+  fi
+
+  if python3 - "$noul" <<'PY'
+import sys
+noul_s, threshold_s = sys.argv[1].split()
+sys.exit(0 if float(noul_s) >= float(threshold_s) else 1)
+PY
+  then
+    decision="continue"
+    reason="noul ${noul%% *} >= threshold ${threshold}; keep building"
+  else
+    decision="stop"
+    reason="noul ${noul%% *} is below JEV_CONTINUE_THRESHOLD ${threshold}; the project does not need more building to meet SPEC.md"
+  fi
+  printf '%s noul=%s threshold=%s decision=%s\n' "$(date '+%F %T')" "${noul%% *}" "$threshold" "$decision" >> "$FACTORY/logs/jev-gate.log"
+  if [ "$decision" = "stop" ]; then
+    printf '%s\n' "Stopped after $task. $reason" > "$FACTORY/logs/jev-stop.txt"
+    log "   jev gate: STOP. $reason"
+    return 1
+  fi
+  log "   jev gate: $reason"
+  return 0
+}
+
 reject() { # <id> <reason>   append feedback, send back to todo or block after MAX_ATTEMPTS
   local f="$B/doing/$1.md" n
   n=$(( $(grep -c '^## Attempt ' "$f") + 1 ))
@@ -130,6 +272,7 @@ log "=== loop start: AGENT_CLI=${AGENT_CLI:-claude} main=$MAIN ==="
 
 for i in $(seq 1 "$MAX_ITERS"); do
   TASK_ID=""
+  merged_task=""
   is_done && { log "Planner declared DONE."; break; }
 
   # ---- PLAN (only when nothing is ready) ----
@@ -164,6 +307,8 @@ for i in $(seq 1 "$MAX_ITERS"); do
   if head -n1 "$HO" | grep -q BLOCKED; then to_main; mv "$TF" "$B/blocked/"; log "   xx worker reported BLOCKED"; continue; fi
 
   # ---- GATE 1: deterministic checks ----
+  # A failing verify.sh rejects the task and blocks the merge. Jev does not run
+  # on this path and cannot waive a failed check.
   if ! ./scripts/verify.sh "$MAIN" > "$FACTORY/logs/verify-$TASK_ID.log" 2>&1; then
     to_main
     reject "$TASK_ID" "scripts/verify.sh failed. Last output:
@@ -178,7 +323,7 @@ $(tail -n 30 "$FACTORY/logs/verify-$TASK_ID.log")
   if head -n1 "$RV" 2>/dev/null | grep -q '^VERDICT: PASS'; then
     to_main
     if git merge -q --no-ff -m "merge $TASK_ID" "$BR"; then
-      git branch -qD "$BR"; mv "$TF" "$B/done/"; merged=$((merged+1)); log "   ✓ $TASK_ID merged"
+      git branch -qD "$BR"; mv "$TF" "$B/done/"; merged=$((merged+1)); merged_task="$TASK_ID"; log "   ✓ $TASK_ID merged"
     else
       git merge --abort; reject "$TASK_ID" "Passed review but conflicted when merging into $MAIN. Redo it on top of current code."
     fi
@@ -198,6 +343,11 @@ $(cat "$RV" 2>/dev/null || echo 'Evaluator wrote no review.')"
       discard; log "   xx cleanup broke verify.sh; reverted"
     fi
     clean_base=$(git rev-parse HEAD); merged=0
+  fi
+
+  # After a merged iteration, before the next pass decides DONE or plans more work.
+  if [ -n "$merged_task" ]; then
+    jev_keep_building "$merged_task" || break
   fi
 done
 

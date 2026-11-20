@@ -57,14 +57,20 @@ Names the harness reads from the environment are listed, without values, in `.en
 
 ## Optional: Jev (TypeSafe System One) judgments
 
-`harness/jev.sh` is a standalone client. The loop does not call it yet. You send a state and typed questions; it returns a yes/no probability, a choice, or a score. It does not edit files or replace the coding agent.
-
-`TYPESAFE_API_KEY` comes from the environment, or from that one assignment in a gitignored `.env` when the variable is unset. The key must never be committed. `JEV_MODEL` defaults to `jev-latest`. `TYPESAFE_API_URL` defaults to `https://api.typesafe.ai/v1/systemone`.
+`harness/jev.sh` sends a state and typed questions to TypeSafe System One and prints the judgment. It does not edit files. You can call it on its own:
 
 ```bash
 harness/jev.sh test              # one canned request; prints the judgment only
 harness/jev.sh < request.json    # raw System One body on stdin; prints JSON
 ```
+
+`TYPESAFE_API_KEY` comes from the environment, or from that one assignment in a gitignored `.env` when the variable is unset. The key must never be committed. `JEV_MODEL` defaults to `jev-latest`. `TYPESAFE_API_URL` defaults to `https://api.typesafe.ai/v1/systemone`.
+
+After each merged iteration, and before the loop looks for the planner's DONE signal, the loop asks one noul question: "Does this project still need more building to meet the intent in SPEC.md? Y/N." The state is `SPEC.md` plus the done, open, and failed task titles and the latest evaluator verdict, trimmed to a few thousand characters. `JEV_CONTINUE_THRESHOLD` (default `0.5`) is the cutoff: a noul at or above it keeps building, and a lower noul stops the loop and records the reason in `.factory/logs/jev-gate.log`.
+
+The check is advisory and fails open. A missing key or a Jev error leaves the existing stops in place (the planner's DONE signal and `MAX_ITERS`). `JEV_GATE=off` disables it. With the variable unset, the check is on only when a key exists. It never merges work that failed `scripts/verify.sh`.
+
+Set `JEV_MOCK_NOUL` (for example `0.2`) to answer without a network call. Mock and CI runs should set it. A mock run that does not set it does not call Jev.
 
 ## The loop
 
@@ -172,7 +178,7 @@ SPEC.md                           your spec (gitignored; setup copies the templa
 .claude/skills  .cursor/skills    symlinks to .agents/skills
 harness/loop.sh                   the orchestrator
 harness/agent.sh                  the only vendor adapter (claude / codex / cursor / mock)
-harness/jev.sh                    optional TypeSafe client; the loop does not call it
+harness/jev.sh                    optional TypeSafe client and post-merge keep-building check
 harness/mock_agent.sh             fake agent for testing the loop
 harness/setup.sh  reset.sh        seed the spec and the board; wipe the board
 scripts/verify.sh                 tamper check plus the stack hook

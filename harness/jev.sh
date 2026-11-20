@@ -19,6 +19,9 @@
 #
 # Optional: JEV_MODEL (default jev-latest), TYPESAFE_API_URL
 #   (default https://api.typesafe.ai/v1/systemone)
+# JEV_MOCK_NOUL, when set, returns that noul for every question and does not
+# make an HTTP call. `harness/jev.sh configured` exits 0 when a key is available
+# and exits 2 when it is not, without printing the key.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -51,17 +54,33 @@ if [ -z "${TYPESAFE_API_KEY:-}" ] && [ -f "$ROOT/.env" ]; then
   done < "$ROOT/.env"
 fi
 
+MODE="${1:-ask}"
 if [ -z "${TYPESAFE_API_KEY:-}" ]; then
-  echo "TYPESAFE_API_KEY is not set. Put it in .env at the repo root, or export it in this shell. Do not commit it or paste it into a prompt." >&2
+  if [ "$MODE" != "configured" ]; then
+    echo "TYPESAFE_API_KEY is not set. Put it in .env at the repo root, or export it in this shell. Do not commit it or paste it into a prompt." >&2
+  fi
   exit 2
 fi
 export TYPESAFE_API_KEY
+if [ "$MODE" = "configured" ]; then
+  exit 0
+fi
 
 export JEV_MODEL="${JEV_MODEL:-jev-latest}"
 export TYPESAFE_API_URL="${TYPESAFE_API_URL:-https://api.typesafe.ai/v1/systemone}"
-MODE="${1:-ask}"
 
-exec python3 - "$MODE" <<'PY'
+# The Python program below is passed on stdin, so read the ask-mode body first.
+# `harness/jev.sh < request.json` keeps working.
+JEV_REQUEST_FILE=""
+if [ "$MODE" = "ask" ]; then
+  JEV_REQUEST_FILE=$(mktemp)
+  cat > "$JEV_REQUEST_FILE"
+fi
+export JEV_REQUEST_FILE
+cleanup_request() { [ -n "$JEV_REQUEST_FILE" ] && rm -f "$JEV_REQUEST_FILE"; }
+trap cleanup_request EXIT
+
+python3 - "$MODE" <<'PY'
 import json, os, sys, urllib.error, urllib.request
 
 mode = sys.argv[1]
@@ -81,7 +100,8 @@ if mode == "test":
         },
     }
 elif mode == "ask":
-    raw = sys.stdin.read()
+    path = os.environ.get("JEV_REQUEST_FILE", "")
+    raw = open(path, encoding="utf-8").read() if path else ""
     if not raw.strip():
         sys.stderr.write("Pass a System One JSON body on stdin, or run: harness/jev.sh test\n")
         sys.exit(2)
@@ -90,6 +110,26 @@ elif mode == "ask":
 else:
     sys.stderr.write("usage: harness/jev.sh test | harness/jev.sh < request.json\n")
     sys.exit(2)
+
+mock_noul = os.environ.get("JEV_MOCK_NOUL", "").strip()
+if mock_noul:
+    try:
+        mocked = float(mock_noul)
+    except ValueError:
+        sys.stderr.write("JEV_MOCK_NOUL is not a number.\n")
+        sys.exit(2)
+    answers = {name: {"noul": mocked} for name in body.get("questions", {})}
+    payload = {"model": "mock", "answers": answers}
+    if mode == "test":
+        noul = answers.get("billing", {}).get("noul")
+        if not isinstance(noul, (int, float)):
+            sys.stderr.write("Jev test response had no billing noul.\n")
+            sys.exit(1)
+        print(f"ok model=mock billing_noul={noul}")
+    else:
+        json.dump(payload, sys.stdout)
+        sys.stdout.write("\n")
+    raise SystemExit(0)
 
 req = urllib.request.Request(
     url,
