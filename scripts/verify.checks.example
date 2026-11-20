@@ -1,0 +1,23 @@
+# Copy this file to scripts/verify.checks and uncomment one stack.
+# scripts/verify.sh runs each remaining line with bash -c from the repo root.
+# Blank lines and lines starting with # are ignored.
+# Commit scripts/verify.checks on the base branch. The verifier treats it as a
+# protected path, so later task branches cannot weaken it.
+#
+# Pass a base ref to run the tamper check as well:
+#   ./scripts/verify.sh origin/main
+
+# TypeScript + Vite
+# npm run --silent typecheck
+# npm run --silent lint
+# npm run --silent test
+# npm run --silent build
+
+# Python
+# python -m pytest
+
+# Go
+# go test ./...
+
+# Rust
+# cargo test
