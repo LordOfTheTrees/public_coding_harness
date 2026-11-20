@@ -1,6 +1,8 @@
 # Agent Factory
 
-Author: LordOfTheTrees
+Author: LordOfTheTrees · [TreePage](https://lordofthetrees.github.io/TreePage/)
+
+Pull requests are welcome. Reviews may be slow.
 
 A stack-agnostic coding harness. Fork it, write a spec, and one bash loop runs a planner, a worker, an evaluator, and a cleaner until the spec is done. The agents can be Claude Code, Codex, or Cursor. A mock agent exercises the plumbing with no model and no API key.
 
@@ -52,6 +54,17 @@ The kit is the loop, the skills, and a blank spec. It does not ship application 
 - Whatever tools your own `scripts/verify.checks` commands call, once you add them
 
 Names the harness reads from the environment are listed, without values, in `.env.example`. The loop does not source `.env`. Export the knobs in the shell.
+
+## Optional: Jev (TypeSafe System One) judgments
+
+`harness/jev.sh` is a standalone client. The loop does not call it yet. You send a state and typed questions; it returns a yes/no probability, a choice, or a score. It does not edit files or replace the coding agent.
+
+`TYPESAFE_API_KEY` comes from the environment, or from that one assignment in a gitignored `.env` when the variable is unset. The key must never be committed. `JEV_MODEL` defaults to `jev-latest`. `TYPESAFE_API_URL` defaults to `https://api.typesafe.ai/v1/systemone`.
+
+```bash
+harness/jev.sh test              # one canned request; prints the judgment only
+harness/jev.sh < request.json    # raw System One body on stdin; prints JSON
+```
 
 ## The loop
 
@@ -159,6 +172,7 @@ SPEC.md                           your spec (gitignored; setup copies the templa
 .claude/skills  .cursor/skills    symlinks to .agents/skills
 harness/loop.sh                   the orchestrator
 harness/agent.sh                  the only vendor adapter (claude / codex / cursor / mock)
+harness/jev.sh                    optional TypeSafe client; the loop does not call it
 harness/mock_agent.sh             fake agent for testing the loop
 harness/setup.sh  reset.sh        seed the spec and the board; wipe the board
 scripts/verify.sh                 tamper check plus the stack hook
