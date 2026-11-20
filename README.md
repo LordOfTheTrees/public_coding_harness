@@ -64,11 +64,19 @@ harness/jev.sh test              # one canned request; prints the judgment only
 harness/jev.sh < request.json    # raw System One body on stdin; prints JSON
 ```
 
-`TYPESAFE_API_KEY` comes from the environment, or from that one assignment in a gitignored `.env` when the variable is unset. The key must never be committed. `JEV_MODEL` defaults to `jev-latest`. `TYPESAFE_API_URL` defaults to `https://api.typesafe.ai/v1/systemone`.
+`TYPESAFE_API_KEY` comes from the environment, or from that one assignment in a gitignored `.env` when the variable is unset. The key must never be committed. `JEV_MODEL` defaults to `jev-latest`. `TYPESAFE_API_URL` defaults to `https://api.typesafe.ai/v1/systemone`. Anyone who tunes `JEV_CONTINUE_THRESHOLD` can pin a model version, for example `jev-1.14.0`, so the threshold does not drift when the `jev-latest` alias moves.
 
-After each merged iteration, and before the loop looks for the planner's DONE signal, the loop asks one noul question: "Does this project still need more building to meet the intent in SPEC.md? Y/N." The state is `SPEC.md` plus the done, open, and failed task titles and the latest evaluator verdict, trimmed to a few thousand characters. `JEV_CONTINUE_THRESHOLD` (default `0.5`) is the cutoff: a noul at or above it keeps building, and a lower noul stops the loop and records the reason in `.factory/logs/jev-gate.log`.
+The loop asks one noul question, "Does this project still need more building to meet the intent in SPEC.md? Y/N.", after a merge, when the planner writes DONE, and when the iteration cap is hit. A noul below `JEV_CONTINUE_THRESHOLD` (default `0.5`) means likely done. Anything at or above it means unfinished. The state is assembled in this order and trimmed from the bottom to `JEV_STATE_TOKEN_BUDGET` (default `24000` tokens, about four characters each, under the 32k state-plus-question limit): `SPEC.md`, the board and the latest evaluator verdict, the latest `verify.sh` result, a code outline, then `git diff --stat` since the previous check. `harness/outline.sh` lists tracked source paths and signatures with doc comments, not function bodies. The outline shows what exists. `scripts/verify.sh` is what says whether it works.
 
-The check is advisory and fails open. A missing key or a Jev error leaves the existing stops in place (the planner's DONE signal and `MAX_ITERS`). `JEV_GATE=off` disables it. With the variable unset, the check is on only when a key exists. It never merges work that failed `scripts/verify.sh`.
+`JEV_MODE` defaults to `log`: the verdict is recorded and the planner's DONE still stops the loop. `enforce` lets Jev affect that stop. `JEV_DONE_AUTHORITY` defaults to `both`.
+
+- `both`: stop only when the planner says DONE and Jev agrees. If the planner says DONE and Jev says unfinished, the planner gets one replan that includes the verdict. A second DONE stops and records the disagreement in `.factory/logs/jev-final.txt`.
+- `planner`: Jev only logs. The planner's DONE stops the loop.
+- `jev`: Jev decides after each merge. The planner's DONE is advisory. Jev still cannot stop while planned tasks are open.
+
+In every authority, log mode only records the verdict. A missing key or a Jev error falls back to the planner. `JEV_GATE=off` does the same. The check never merges work that failed `scripts/verify.sh`.
+
+Hitting `MAX_ITERS` writes `.factory/logs/jev-final.txt` and prints `likely done` or `unfinished` with the noul. `JEV_EXTEND_ITERS` (default `0`) can grant one extension of that many iterations when mode is `enforce` and Jev says unfinished. The next cap writes another final verdict and does not extend again.
 
 Set `JEV_MOCK_NOUL` (for example `0.2`) to answer without a network call. Mock and CI runs should set it. A mock run that does not set it does not call Jev.
 
@@ -178,7 +186,8 @@ SPEC.md                           your spec (gitignored; setup copies the templa
 .claude/skills  .cursor/skills    symlinks to .agents/skills
 harness/loop.sh                   the orchestrator
 harness/agent.sh                  the only vendor adapter (claude / codex / cursor / mock)
-harness/jev.sh                    optional TypeSafe client and post-merge keep-building check
+harness/jev.sh                    optional TypeSafe client and keep-building check
+harness/outline.sh                signatures of tracked source files, no bodies
 harness/mock_agent.sh             fake agent for testing the loop
 harness/setup.sh  reset.sh        seed the spec and the board; wipe the board
 scripts/verify.sh                 tamper check plus the stack hook
